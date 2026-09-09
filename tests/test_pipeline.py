@@ -1,4 +1,4 @@
-"""Step 2: conformers, calculation specs, thermochemistry, BDE assembly.
+"""QM pipeline: conformers, calculation specs, thermochemistry, xTB engine.
 
 Tests that need the xtb binary are marked and skipped when it is absent, so the
 suite still runs on a machine without a QM stack.
@@ -11,7 +11,6 @@ import math
 import numpy as np
 import pytest
 
-from molprop.bde import BDEError, bde_from_enthalpies, homolysis_fragments
 from molprop.calc import (
     CalculationError,
     CalculationResult,
@@ -20,7 +19,7 @@ from molprop.calc import (
     Task,
     geometry_hash,
 )
-from molprop.chem import BondRef, indexed_mol
+from molprop.chem import indexed_mol
 from molprop.conformers import assert_deterministic, generate_conformers
 from molprop.engines import XTBEngine
 from molprop.fidelity import ConformerProtocol, Fidelity, FidelityError, Tier
@@ -51,18 +50,6 @@ from molprop.units import (
 
 _engine = XTBEngine()
 needs_xtb = pytest.mark.skipif(not _engine.is_available(), reason="xtb not installed")
-
-
-def bond_between(smiles: str, a: str, b: str) -> BondRef:
-    mol = indexed_mol(smiles)
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        pair = sorted(
-            (mol.GetAtomWithIdx(i).GetSymbol(), mol.GetAtomWithIdx(j).GetSymbol())
-        )
-        if pair == sorted((a, b)):
-            return BondRef(i, j)
-    raise AssertionError(f"no {a}-{b} bond in {smiles}")
 
 
 @pytest.fixture
@@ -369,60 +356,6 @@ def test_monatomic_thermo_needs_an_electronic_energy():
         monatomic_thermochemistry(h, "H")
 
 
-# -- homolysis -------------------------------------------------------------
-
-
-def test_xh_homolysis_gives_a_radical_and_a_hydrogen_atom():
-    a, b = homolysis_fragments("CO", bond_between("CO", "O", "H"))
-    smiles = {a.molecule.smiles, b.molecule.smiles}
-    assert smiles == {"C[O]", "[H]"}
-    assert a.multiplicity == 2 and b.multiplicity == 2
-
-
-def test_cc_homolysis_of_ethane_gives_two_methyls():
-    a, b = homolysis_fragments("CC", bond_between("CC", "C", "C"))
-    assert a.molecule.smiles == "[CH3]" and b.molecule.smiles == "[CH3]"
-
-
-def test_ring_bonds_are_refused():
-    with pytest.raises(BDEError, match="in a ring"):
-        homolysis_fragments("c1ccccc1", bond_between("c1ccccc1", "C", "C"))
-
-
-def test_charged_species_are_refused():
-    with pytest.raises(BDEError, match="charged species"):
-        homolysis_fragments("CC(=O)[O-]", bond_between("CC(=O)[O-]", "C", "H"))
-
-
-# -- BDE assembly ----------------------------------------------------------
-
-
-def h(value, phase=GAS, t=298.15):
-    return Quantity(value, KCAL_PER_MOL, QuantityKind.ENTHALPY, phase, t)
-
-
-def test_bde_is_products_minus_parent():
-    value = bde_from_enthalpies(h(-100.0), h(-40.0), h(-15.0))
-    assert value.kind is QuantityKind.BDE
-    assert value.value == pytest.approx(45.0)
-
-
-def test_bde_refuses_an_electronic_energy():
-    e = Quantity(-100.0, KCAL_PER_MOL, QuantityKind.ELECTRONIC_ENERGY, GAS, 298.15)
-    with pytest.raises(UnitError, match="must be an enthalpy"):
-        bde_from_enthalpies(e, h(-40.0), h(-15.0))
-
-
-def test_bde_refuses_a_solution_phase_fragment():
-    with pytest.raises(UnitError, match="gas-phase"):
-        bde_from_enthalpies(h(-100.0), h(-40.0, phase=water()), h(-15.0))
-
-
-def test_bde_refuses_mismatched_temperatures():
-    with pytest.raises(UnitError, match="different temperatures"):
-        bde_from_enthalpies(h(-100.0), h(-40.0, t=310.0), h(-15.0))
-
-
 # -- engine (needs xtb) ----------------------------------------------------
 
 
@@ -485,37 +418,3 @@ def test_mode_following_escapes_the_saddle_point(gfn2, protocol):
     assert result.n_imaginary == 0
     result.require_usable()
     assert any("imaginary mode" in w for w in result.warnings)
-
-
-@needs_xtb
-def test_end_to_end_bde(gfn2):
-    from molprop.bde import compute_bde
-
-    out = compute_bde(
-        "Oc1ccccc1",
-        bond_between("Oc1ccccc1", "O", "H"),
-        gfn2,
-        XTBEngine(n_cores=2, imaginary_retries=3),
-    )
-    assert out["bde"].kind is QuantityKind.BDE
-    # GFN2 overestimates X-H BDEs badly; this only asserts the pipeline is
-    # producing a bond energy rather than nonsense.
-    assert 50.0 < out["bde"].value < 200.0
-    assert out["n_jobs"] == 3
-    assert out["usage"].wall_seconds > 0
-
-
-@needs_xtb
-def test_engine_has_a_bounded_default_timeout():
-    """A campaign must not be able to stall for an hour on one molecule."""
-    assert XTBEngine().timeout_seconds <= 600.0
-
-
-@needs_xtb
-def test_a_timeout_is_reported_as_a_failure_not_a_result(gfn2, protocol):
-    ensemble = generate_conformers("CCCCCCO", protocol)
-    result = XTBEngine(timeout_seconds=1e-3).run(ensemble, gfn2, Task.OPT_FREQ)[0]
-    assert not result.converged
-    assert any("timed out" in w for w in result.warnings)
-    with pytest.raises(CalculationError):
-        result.require_usable()

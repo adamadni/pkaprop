@@ -60,6 +60,7 @@ __all__ = [
     "PKaImportReport",
     "load_sampl6",
     "load_czodrowskilab",
+    "map_atom_to_canonical",
 ]
 
 SAMPL6_PROVENANCE = {
@@ -78,6 +79,36 @@ CZODROWSKILAB_PROVENANCE = {
 EXPERIMENT = Fidelity(tier=Tier.EXPERIMENT, method="experiment")
 
 _UNCHARGER = rdMolStandardize.Uncharger()
+
+
+def map_atom_to_canonical(mol: Chem.Mol, atom_idx: int) -> int | None:
+    """Translate an atom index from a source mol into this package's ordering.
+
+    `marvin_atom` indexes the SDF atom block, but records key on the canonical
+    SMILES of the NEUTRAL PARENT -- a different molecule with a different atom
+    order. Reusing the integer would silently point at the wrong atom, which is
+    the same class of bug that the ALFABET bond indices had.
+
+    Neutralisation is done in place so atom order is preserved, then canonical
+    ranks give a deterministic correspondence that is robust to symmetry.
+    """
+    try:
+        neutral = rdMolStandardize.ChargeParent(Chem.Mol(mol))
+    except Exception:
+        return None
+    if neutral is None or neutral.GetNumAtoms() != mol.GetNumAtoms():
+        # ChargeParent may also strip salts, which reorders/removes atoms; in
+        # that case the index cannot be trusted and is dropped rather than guessed.
+        return None
+    canonical = Chem.MolFromSmiles(Chem.MolToSmiles(neutral, isomericSmiles=True))
+    if canonical is None or canonical.GetNumAtoms() != neutral.GetNumAtoms():
+        return None
+    source_ranks = list(Chem.CanonicalRankAtoms(neutral, breakTies=True))
+    target_ranks = list(Chem.CanonicalRankAtoms(canonical, breakTies=True))
+    position = {rank: i for i, rank in enumerate(target_ranks)}
+    if not 0 <= atom_idx < len(source_ranks):
+        return None
+    return position.get(source_ranks[atom_idx])
 
 
 @functools.lru_cache(maxsize=100_000)
@@ -259,6 +290,13 @@ def load_czodrowskilab(
                     # Marvin's site and type are PREDICTIONS, not measurements.
                     # They must never become site_atom_idx on a macroscopic value.
                     "marvin_predicted_atom": props.get("marvin_atom"),
+                    # ... and the raw index is useless downstream without this
+                    # remap into the canonical neutral-parent atom ordering.
+                    "marvin_predicted_atom_canonical": (
+                        map_atom_to_canonical(mol, int(props["marvin_atom"]))
+                        if props.get("marvin_atom") is not None
+                        else None
+                    ),
                     "marvin_predicted_pka": props.get("marvin_pKa"),
                     "marvin_predicted_type": props.get("marvin_pKa_type"),
                     "original_dataset": props.get("original_dataset"),

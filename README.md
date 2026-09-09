@@ -1,232 +1,326 @@
-# molprop
+# molprop — physics-informed pKa prediction
 
-Drug-oriented QM property prediction: bond dissociation energies, pKa, tautomer
-ratios. Delta-learning from a cheap method to a reference, with fidelity as a
-model input and uncertainty-driven selection of what to compute next.
+Predicts a pKa for **every ionisable site** in a small molecule and reports the
+**most acidic** one. A graph neural network does the learning; GFN2-xTB
+electronic descriptors supply the physics prior.
 
-**Status: steps 1, 1b and 2 complete.** The infrastructure layer makes silent
-errors impossible; the pipeline layer computes real numbers through it.
+```python
+from molprop.training import most_acidic_site
 
-`xtb` 6.7.1 runs locally (conda-forge ships a win-64 build), so the whole
-semiempirical stage — conformers, optimisation, Hessians, BDE assembly — needs
-no remote compute. A full GFN2 BDE (parent + two radical fragments, each
-optimised with a Hessian) takes ~0.3 s.
+most_acidic_site(model, "NCCc1ccc(O)c(O)c1")   # dopamine
+# {'smiles': 'NCCc1ccc(O)c(O)c1',
+#  'most_acidic': {'atom_index': 6, 'kind': 'acid', 'pka': 9.1},
+#  'sites': [...]}                              # every site, sorted
+```
 
-## Install
+---
+
+## Results
+
+Scaffold split at molecule level, 5,994 compounds. **There is no random split
+anywhere in this project** — see [Splitting](#splitting).
+
+| system | MAE | RMSE | R² | within 1 unit | within 2 |
+|---|---|---|---|---|---|
+| global median | 1.95 | 2.29 | −0.00 | 28% | 52% |
+| acid/base median | 1.83 | 2.22 | 0.06 | 30% | 61% |
+| site-class median | 1.34 | 1.75 | 0.42 | 49% | 75% |
+| **pKa GNN** | **0.84** | **1.21** | **0.72** | **71%** | **90%** |
+
+Held-out sets curated by the data source, never seen in training or validation:
+
+| set | n | MAE | RMSE | within 1 unit |
+|---|---|---|---|---|
+| Novartis | 280 | 1.03 | 1.39 | 58% |
+| AvLiLuMoVe | 123 | 0.57 | 0.80 | 85% |
+
+The baseline that matters is **site-class median** — the pKa you would guess
+from knowing only the functional group (carboxylic acid, aliphatic amine,
+phenol…). Beating it by 0.50 log units is the claim that the model has learned
+substituent effects rather than group identity. `ResultCard` refuses to be
+constructed without a baseline on the same split, so this comparison cannot be
+quietly omitted from a report.
+
+---
+
+## The target, and why it is defined this way
+
+Every ionisable proton has a pKa. A carboxylic acid donates one directly; an
+amine's proton belongs to its *conjugate acid*. Both are deprotonations, so the
+sign convention is uniform.
+
+**"Most acidic site" = argmin over every site's predicted pKa** — acid sites
+scored by the acidic head, basic sites by the basic head.
+
+That definition was not the obvious one, and getting it wrong is easy. The
+natural first framing — "predict the pKa of the most acidic proton" — is wrong
+for this corpus, because **60% of the compounds are bases** (3,596 basic vs
+2,398 acidic). For a base, the recorded value is the pKa of the conjugate acid
+at the most *basic* centre, which in the protonated species is the *least*
+acidic proton. Framing the target around acidic protons alone mislabels the
+majority of the data. Scoring both site types and taking the global minimum is
+what makes the question well posed.
+
+---
+
+## Architecture
+
+### Why a GNN at all
+
+pKa is a **local** property with **non-local modifiers**. Which atom loses the
+proton is decided by its immediate environment; how easily depends on
+substituents several bonds away donating or withdrawing electron density. That
+is a graph problem: a fingerprint discards the site, and a flat descriptor
+vector discards the topology through which the substituent effect travels.
+
+### Per-atom output, not per-molecule
+
+The prediction is attached to an **atom**. A whole-molecule regressor could emit
+a number but could never point at a site, and pooling to a molecule vector
+discards exactly the locality the answer depends on.
+
+### Edge-conditioned message passing
+
+Messages are built from `[h_source, h_target, edge_features]`.
+
+Acidity is set by how well the conjugate base delocalises charge, and that
+propagates through bonds — inductive effects through σ bonds, resonance through
+π systems. A convolution whose messages depend on the **bond** as well as the
+neighbouring atom can distinguish those. One that sees only neighbour identities
+cannot tell a conjugated path from a saturated one, which is roughly the
+difference between a phenol (pKa 10) and a cyclohexanol (pKa 16).
+
+### Depth 4
+
+A Hammett substituent effect reaches roughly 4–6 bonds through a conjugated
+system before decaying into noise. Four rounds give each atom a 4-bond receptive
+field, covering *para* substitution on a ring bearing the ionisable group — the
+canonical long-range case. Deeper mostly buys over-smoothing, where every atom
+in a fused ring converges to the same embedding.
+
+### Residual updates with layer norm
+
+At depth 4 on ~20-atom graphs, plain stacking washes out the atom's own
+identity. A residual update keeps the site's local character (an oxygen stays
+recognisably an oxygen) while the message stream carries the environment.
+
+### Two heads, one for acids and one for bases
+
+The same nitrogen has an "acidic pKa" near 35 and a "basic pKa" near 10. These
+are different physical quantities that happen to share an atom. A single head
+would have to fit a strongly bimodal target conditioned on an unstated variable.
+
+**Only the head matching a record's type is supervised.** An amine has no
+measured acidic pKa, so inventing a target for it would teach the acidic head
+chemistry that was never observed. The unmatched head receives no gradient from
+that example.
+
+### Sum-pooled global context
+
+A small molecule-level vector is concatenated into the per-atom head. Overall
+charge and molecular size shift pKa systematically, and a purely local readout
+cannot see them.
+
+### Huber loss
+
+The corpus contains a few extreme or mis-transcribed values. Squared error would
+let them dominate the gradient; Huber keeps them informative without letting
+them steer.
+
+---
+
+## The physics: GFN2-xTB descriptors
+
+Two quantities per molecule, from a single point on one force-field conformer:
+
+- **Mulliken partial charges** (per atom). Acidity is largely the question of
+  how well the conjugate base stabilises negative charge, so the charge already
+  present at a site is a direct prior on that.
+- **Wiberg bond orders** (per bond, summed per atom). This measures
+  delocalisation: a carboxyl oxygen with substantial partial double-bond
+  character behaves very differently from an isolated alkoxide.
+
+**They are optional, and that is the point.** `featurise` zero-fills those
+columns when descriptors are absent, so the identical architecture trains with
+and without them. `--no-xtb` is a real ablation, not a fallback — the only way
+to know whether the physics earns its compute is to measure it.
+
+One conformer is used deliberately: these quantities are dominated by
+connectivity and only weakly conformer-dependent, while generating and
+optimising five conformers costs more than the xTB call itself. That trade-off
+is part of the cache key, so revisiting it cannot silently reuse stale
+descriptors.
+
+---
+
+## Data
+
+| dataset | n | role | source |
+|---|---|---|---|
+| czodrowskilab combined | 5,994 | train / val / test | [Machine-learning-meets-pKa](https://github.com/czodrowskilab/Machine-learning-meets-pKa) (MIT) |
+| Novartis | 280 | held out | same repo, source-curated monoprotic |
+| AvLiLuMoVe | 123 | held out | same repo, source-curated monoprotic |
+| SAMPL6 | 31 | reference | [SAMPL6](https://github.com/samplchallenges/SAMPL6) (MIT), 25 °C / 0.15 M KCl |
+
+`python scripts/fetch_data.py` downloads everything with checksums.
+
+### Three curation decisions, each a silent error if reversed
+
+**1. The site label is a prediction, and this is stated.** The pKa *value* is
+experimental. The *site* comes from Marvin, distributed with the source, and
+nobody measured which atom titrates for these 5,994 compounds. The model learns
+"the experimental pKa, at the site Marvin believes is responsible". It is kept
+in `metadata`, never in `PKaRecord.site_atom_idx`, so a macroscopic value can
+never masquerade as a microscopic measurement.
+
+**2. Molecule identity is the neutral parent.** Sources disagree about
+protonation state — **3,363 of 5,994** training rows and 114/280 Novartis rows
+were stored as charged species. Keying on the published form would give one
+compound two identities and let it straddle a train/test boundary.
+
+**3. Atom indices are remapped, not reused.** `marvin_atom` indexes the original
+SDF atom block; records key on the canonical neutral parent — a different
+molecule with a different atom order. Reusing the integer points at the wrong
+atom. `map_atom_to_canonical` remaps through canonical ranks and lands on a
+heteroatom for **5,928/5,994 (98.9%)**.
+
+### Known data limitations
+
+- **Temperature and ionic strength are not distributed** with the czodrowskilab
+  corpus. `audit_pka_records` raises `missing-temperature` as an **error**
+  rather than filling in a plausible 298.15 K.
+- **Macroscopic labels on polyprotic compounds.** Many compounds have more than
+  one ionisable centre but carry a single recorded value, so which equilibrium
+  it refers to is an assumption. The audit reports the count on every import.
+- **A leak in the obvious validation setup.** SAMPL6 **SM11** appears in the
+  training corpus with an identical value (3.89, via DataWarrior). Exclude it
+  before using SAMPL6 as a blind set.
+- SAMPL6 ships no Marvin site annotations, so it cannot yet be scored
+  site-wise; its 10 NMR-determined microstates are the right future check, and
+  the only genuinely measured site assignments available anywhere here.
+
+---
+
+## Splitting
+
+**There is no random split, and `molprop.splits.random_split` does not exist** —
+asking for it by name raises with an explanation. Three strategies are
+provided: `scaffold_split`, `reaction_centre_split`, `time_split`. Allocation is
+deterministic (no RNG).
+
+- **Group integrity.** One molecule contributes a record per titration step.
+  Every assignment is checked so a molecule cannot straddle folds.
+- **A `frozen_test` partition** is always reserved and is never available for
+  model selection.
+- **Scaffold is the wrong invariant for a local property**, so
+  `reaction_centre_split` groups on the ionisable site's environment instead —
+  a molecule can change scaffold entirely while keeping the same aniline.
+
+---
+
+## Correctness layer
+
+The parts that exist to make silent errors impossible rather than unlikely.
+
+**`units`** — every value carries a unit, a *kind* (pKa vs Gibbs vs enthalpy), a
+phase and a temperature, and arithmetic across a mismatch raises. The expensive
+bug in this domain is not kcal/kJ confusion; it is using an electronic energy
+where a free energy was meant, which is numerically plausible and silently
+wrong. `RT·ln(10) = 1.3642 kcal/mol at 298.15 K` is defined in exactly one
+place, and only `DELTA_GIBBS` may be converted to a pKa.
+
+**`enumeration`** — finds protonation sites and generates microstates, validated
+against SAMPL6's published enumeration:
+
+| comparison | exact SMILES | as species |
+|---|---|---|
+| microstates in an experimental pKa transition | 13/20 (65%) | **19/20 (95%)** |
+| SAMPL6's full published enumeration | 129/351 (37%) | 92/144 (64%) |
+
+The columns differ because SAMPL6 enumerates *Lewis structures*: its 351
+microstates are only **144 distinct chemical species**. `species_key` uses the
+full InChIKey, whose mobile-H layer merges tautomers while the `/p` layer keeps
+protonation levels apart.
+
+Its site patterns were not guessed. Auditing the 231 corpus compounds that had a
+measured pKa but no detected site produced five genuinely missing classes —
+hydrazines, hydroxamic acids, aromatic amidines, tertiary anilines, peroxy and
+sulfinic acids — taking undetected compounds from **231 → 69 (1.2%)** with no
+loss of SAMPL6 recall. The remainder are carbon acids, whose acidity comes from
+delocalisation rather than a heteroatom–H bond; they are excluded and documented
+rather than guessed at.
+
+**`microstates`** — aggregates site-level pKa into macroscopic constants via the
+partition-function relation, so the statistical factor falls out correctly (two
+independent sites at micro pKa 4.0 give macro 3.699 and 4.301). The reverse
+decomposition raises `NotImplementedError` because it is underdetermined.
+
+**`cards`** — a `ResultCard` cannot be built without a baseline on the same
+split id and partition, with commensurable metric units.
+
+---
+
+## Install and run
 
 ```bash
 mamba env create -f environment.yml
 conda activate molprop
-pip install -e . --no-deps
+pip install -e ".[dev]"
+
+python scripts/fetch_data.py              # download sources with checksums
+python scripts/precompute_xtb.py          # warm the descriptor cache
+python scripts/train_pka.py --xtb         # train with physics
+python scripts/train_pka.py --no-xtb      # ablation without it
+
 pytest
 ```
 
-## The four invariants
+`precompute_xtb.py` takes `--shard i --num-shards n` for parallel warming.
 
-Each is enforced by construction, not by convention.
+---
 
-### 1. Every value carries units, kind, phase and temperature (`units.py`)
-
-`Quantity` refuses arithmetic across a mismatch. Three distinct error classes
-are blocked: unit confusion (kcal/mol vs kJ/mol vs hartree), *kind* confusion
-(electronic energy used where enthalpy or Gibbs was meant — numerically
-plausible as each other, and the most expensive silent bug in this domain), and
-ensemble confusion (gas-phase mixed with solution-phase, or different
-temperatures).
-
-```python
->>> g(10.0, GAS) + h(4.0, GAS)
-UnitError: cannot add G and H
->>> g(1.0, phase=GAS) + g(1.0, phase=water())
-UnitError: cannot add across phases: gas vs solution(water)
->>> g(1.0) + 2.0
-UnitError: cannot add float and Quantity; wrap the bare number in a Quantity
-```
-
-`R*T*ln(10) = 1.3642 kcal/mol at 298.15 K` is defined in exactly one place.
-`log10_to_molar_energy` / `molar_energy_to_log10` are the only bridge between
-log units and free energy, and the reverse direction accepts **only**
-`DELTA_GIBBS` — deriving a pKa from an enthalpy omits the entropic term, so it
-raises rather than returning a wrong number.
-
-### 2. "DFT" is not a fidelity label (`fidelity.py`)
-
-wB97X-D/def2-TZVPD/SMD and B3LYP/6-31G\*/PCM differ by more than the delta being
-learned. A `Fidelity` carries method, basis, dispersion, solvation model and
-solvent, geometry source, software and version — and a `ConformerProtocol`,
-because for pKa and tautomer ratios the choice between lowest-conformer and a
-Boltzmann ensemble moves the answer more than the functional does. Constructing
-a DFT fidelity without a basis raises.
-
-The two property tracks are structurally different, and `DeltaSpec` is where
-that is made explicit:
-
-| track | base | target | why |
-|---|---|---|---|
-| BDE | GFN2-xTB | DFT | DFT is a legitimate gas-phase ground truth |
-| pKa | xTB or DFT | **experiment** | a DFT pKa is itself an empirically calibrated quantity, so it is a rung, never the reference |
-
-### 3. Macro and micro pKa are different targets (`microstates.py`)
-
-Experimental labels are macroscopic; a site model predicts microscopic. For any
-polyprotic molecule these differ. `macro_pka_from_microstates` aggregates with
-the standard partition-function relation, so the statistical factor falls out:
-two independent sites at micro pKa 4.0 give macro pKa₁ = 3.699 and pKa₂ = 4.301.
-
-The reverse (`micro_pka_from_macro`) raises `NotImplementedError` and says why:
-the decomposition is underdetermined without site-resolved measurement.
-
-### 4. No random splits, no leakage, no unbaselined result (`splits.py`, `cards.py`)
-
-There is no `random_split`; asking for one by name raises with an explanation.
-Three strategies exist: `scaffold_split`, `reaction_centre_split`, `time_split`.
-Allocation is deterministic (no RNG), and every split reserves a **`frozen_test`**
-partition that active learning may never draw from.
-
-Two subtleties the module surfaces rather than hides:
-
-- **Group integrity.** A molecule contributes many BDE records; scattering them
-  across folds leaks. Every assignment is checked against the record's
-  `group_key`.
-- **Scaffold is the wrong invariant for a local property.** pKa is dominated by
-  the ionisable site's environment, so a novel scaffold carrying a familiar
-  aniline is trivially predicted. `reaction_centre_split` groups on the site
-  environment — but for a multi-site property like BDE, centre holdout and
-  molecule integrity are *incompatible*, and the split raises rather than
-  silently degenerating into a molecule split. Choose `group_integrity="centre"`
-  deliberately, or use `scaffold_split`.
-
-A `ResultCard` cannot be constructed without at least one baseline evaluated on
-the same split id and the same partition, with commensurable metric units.
-Metrics without units are rejected unless the name is a known dimensionless
-score.
-
-## Curation contract (`curation.py`)
-
-`audit_pka_records` and `audit_tautomer_records` check a candidate batch before
-registration. Codes emitted:
-
-| code | severity | what it catches |
-|---|---|---|
-| `mixed-resolution` | error | macro and micro pKa pooled as one target |
-| `mixed-solvent` | error | methanol/water values pooled with aqueous |
-| `missing-temperature` | error | a pKa that cannot become a free energy |
-| `non-contiguous-steps` | error | a titration with an unrecorded equilibrium |
-| `site-has-no-proton` | error | a site index against the wrong atom ordering |
-| `conflicting-duplicate` | error | one compound, two irreconcilable values |
-| `incomplete-titration` | warning | polyprotic compound with a single macro pKa |
-| `implausible-value` | warning | extrapolations and unit errors |
-| `saturated-ratio` | warning | "only the keto form is seen" encoded as a number |
-| `not-a-tautomer-pair` | warning | structures RDKit cannot connect by tautomerism |
-| `missing-ionic-strength` | warning | fine for one source, not for a pooled set |
-| `missing-date` | warning | blocks a time split |
-
-`KNOWN_PKA_SOURCES` and `KNOWN_TAUTOMER_SOURCES` list candidate sources with
-their caveats. Their `doi`, `url` and `n_records` are deliberately unset: those
-get filled from the artefact actually downloaded in step 4, so a manifest never
-carries provenance nobody verified.
-
-## Registry (`registry.py`)
-
-`<root>/<name>/<version>/{records.jsonl, manifest.json}`. Content is hashed
-(order-independent) and `load` refuses to return records that do not match the
-manifest. `write` runs a units audit and refuses a dataset that silently mixes
-kinds, solvents or temperatures unless `allow_mixed_conditions=True`.
-Registered versions are immutable — bump the version rather than mutating.
-
-Fidelities are stored **once** in the manifest and referenced by id from each
-row; null fields are dropped. A dataset has few fidelities and many rows, so
-inlining spent most of the file restating the same 500 bytes — ALFABET went
-from 463 MB to 206 MB. Rows carrying an inline `fidelity` (the earlier layout)
-still load, and a row referencing a fidelity the manifest does not define is a
-hard error rather than a silent substitution.
-
-## Registered datasets
-
-| name | version | records | provenance |
-|---|---|---|---|
-| `alfabet-bde-db` | v2 | 484,907 | figshare `10.6084/m9.figshare.10248932`, MIT, md5-verified |
-| `pka-czodrowskilab-train` | v1 | 5,994 | czodrowskilab/Machine-learning-meets-pKa, MIT |
-| `pka-novartis` | v1 | 280 | same repo, held-out test set |
-| `pka-avlilumove` | v1 | 123 | same repo, held-out test set |
-| `pka-sampl6` | v1 | 31 | samplchallenges/SAMPL6, MIT, 25 C / 0.15 M KCl |
-
-Each pKa manifest embeds its curation audit at import time. Three decisions are
-baked into `datasets/pka.py` because the alternative is a silent error:
-molecule identity is the **neutral parent** (sources disagree about protonation
-state, and 3,363 of 5,994 training rows needed normalising); Marvin's
-`marvin_atom` is a **prediction** kept in metadata and never used as
-`site_atom_idx` on a macroscopic value; and temperature is left **unset** where
-the source does not distribute it, so the audit raises rather than a plausible
-298.15 being invented.
-
-ALFABET's `bond_index` indexes into `AddHs(MolFromSmiles(molecule))` using its
-SMILES *as written*, and ~0.9% of those are not RDKit-canonical — so reusing the
-integer directly picks the wrong bond. `datasets.alfabet.canonical_bond`
-remaps through canonical atom ranks, and every row is gated on its element pair
-matching the published `bond_type` column.
-
-**The published 0.58 kcal/mol MAE is on a random molecule-level holdout.** This
-project uses scaffold splits only, so no result here is comparable to that
-number, and the result-card notes must say so rather than implying otherwise.
-
-## Atom indexing
-
-Record atom indices (BDE bonds, microscopic pKa sites) are meaningless without a
-fixed atom ordering. The convention throughout:
+## Layout
 
 ```
-identity    = canonical isomeric SMILES (RDKit, no explicit hydrogens)
-indexed mol = Chem.AddHs(Chem.MolFromSmiles(identity))
+src/molprop/
+  units.py        typed quantities; mismatches raise
+  chem.py         deterministic atom ordering
+  records.py      PKaRecord: macro vs micro must be declared
+  enumeration.py  protonation sites and microstates (SAMPL6-validated)
+  microstates.py  micro -> macro aggregation
+  curation.py     import-time audits
+  splits.py       scaffold / reaction-centre / time; no random split
+  registry.py     content-hashed datasets with provenance
+  cards.py        results, baseline-enforced
+  features.py     graph tensors + xTB descriptors
+  model.py        the GNN
+  training.py     dataset assembly, fitting, inference
+  fidelity.py     level-of-theory specification
+  conformers.py   ETKDGv3 + MMFF, deterministic
+  engines/xtb.py  GFN2-xTB driver
+  geometry.py calc.py thermo.py    QM plumbing
+scripts/
+  fetch_data.py  precompute_xtb.py  train_pka.py
 ```
 
-`AddHs` appends hydrogens after the heavy atoms in heavy-atom order, so indices
-are a deterministic function of the identity string alone.
+---
 
-## The pipeline (step 2)
+## Project history
 
-```
-SMILES -> conformers.generate_conformers   ETKDGv3 + MMFF94s, seeded, RMSD-pruned
-       -> engines.XTBEngine.run            GFN2-xTB opt + Hessian
-       -> thermo.ensemble_quantity         lowest or Boltzmann reduction
-       -> bde.compute_bde                  H(A.) + H(B.) - H(A-B)
-```
+This codebase began as a broader QM property predictor covering bond
+dissociation energies, pKa and tautomer ratios, and was rescoped to pKa alone.
+The BDE track — ALFABET import, xTB campaigns, a direct-vs-delta ablation — is
+preserved in commit `c0fa78b` rather than deleted outright.
 
-Five things the pipeline handles that a first draft would not:
+Two findings from that work shaped this one. GFN2-xTB explains ~74% of C–H
+bond-strength variance but only ~10% for O–H (r = 0.51, n = 1,528), so cheap
+semiempirical thermochemistry is weakest exactly where acidic chemistry lives —
+which is why xTB enters here as a *descriptor* feeding a learned model rather
+than as a physical baseline to correct. And on the BDE benchmark an aggregate
+MAE of 2.33 hid a model that was 6× **worse** than a trivial lookup on rare bond
+types, which is why results here are reported against a class-wise baseline
+rather than a single headline number.
 
-* **Spin.** xtb's `--uhf` takes unpaired electrons, not multiplicity. Fragment
-  multiplicity is derived from the radical count and checked against electron
-  parity, so a radical can never be computed as a closed shell.
-* **The hydrogen atom.** Every X-H homolysis produces one. It has no MMFF
-  parameters and no vibrations, so xtb refuses `--ohess`. It gets a single point
-  plus analytic ideal-gas thermochemistry (Sackur-Tetrode), which reproduces the
-  tabulated 27.4 cal/(mol K) standard entropy.
-* **Saddle points.** A structure with imaginary frequencies is not a minimum and
-  its "free energy" is not a free energy. `require_usable()` refuses it. With
-  `imaginary_retries`, the engine displaces along the imaginary mode and
-  re-optimises, which recovers both torsional saddles and Jahn-Teller cases.
-* **Encoding.** xtb writes UTF-8; Windows would decode as cp1252 and crash on
-  the first Greek letter. `normal termination of xtb` goes to *stderr*.
-* **Cost.** Wall time and core-hours are recorded per job and summed per BDE.
-  An unpriced run reports `None`, never zero.
+## Licence
 
-### Determinism gate
-
-`conformers.assert_deterministic` runs a protocol several times and requires
-byte-identical geometries. A failure means the fidelity id is lying. Embedding
-is single-threaded for that reason, and RMSD pruning happens only *after*
-force-field optimisation, so `rmsd_prune_angstrom` means one thing rather than
-two.
-
-`rmsd_atoms="heavy"` cannot see O-H / N-H rotamers, which change intramolecular
-hydrogen bonding. The pKa and tautomer tracks should set `"all"`.
-
-## Next
-
-Reference data. The validation gates that matter -- reproduce ALFABET BDEs at
-their level of theory, reproduce SAMPL6 pKa -- need those datasets registered,
-and by this project's own curation rule their provenance must come from the
-downloaded artefact rather than from memory.
-
-Then a DFT engine. PySCF is Linux-only and Psi4 ships only py310 builds for
-win-64, so that stage is the one that goes to Runpod.
+MIT. Both upstream datasets are MIT licensed.

@@ -7,25 +7,16 @@ from conftest import find_atom
 
 from molprop.curation import (
     KNOWN_PKA_SOURCES,
-    KNOWN_TAUTOMER_SOURCES,
-    are_tautomers,
     audit_pka_records,
-    audit_tautomer_records,
     ionisable_sites,
     summarise,
 )
-from molprop.records import MoleculeRef, PKaRecord, TautomerRecord
+from molprop.records import MoleculeRef, PKaRecord
 from molprop.units import LOG10_UNIT, Phase, Quantity, QuantityKind, water
 
 
 def pka_q(value=4.76, phase=None, t=298.15):
     return Quantity(value, LOG10_UNIT, QuantityKind.PKA, phase or water(0.15), t)
-
-
-def logkt_q(value=0.8, phase=None):
-    return Quantity(
-        value, LOG10_UNIT, QuantityKind.LOG_TAUTOMER_RATIO, phase or water(0.15), 298.15
-    )
 
 
 def macro(smiles, value=4.76, step=1, phase=None, source="iupac", date="2001-01-01", **kw):
@@ -48,7 +39,7 @@ def codes(issues):
 
 
 def test_source_specs_state_caveats_and_leave_provenance_unset():
-    for spec in (*KNOWN_PKA_SOURCES, *KNOWN_TAUTOMER_SOURCES):
+    for spec in KNOWN_PKA_SOURCES:
         assert spec.caveats, f"{spec.name} records no caveats"
         assert spec.doi is None and spec.n_records is None, (
             "provenance must be filled from the downloaded artefact, not from memory"
@@ -183,54 +174,6 @@ def test_a_site_without_a_proton_is_caught(experiment):
         date="2018-01-01",
     )
     assert "site-has-no-proton" in codes(audit_pka_records([rec]))
-
-
-# -- tautomer audit --------------------------------------------------------
-
-
-def taut(a, b, value=0.8, phase=None, fidelity=None, date="2010-01-01"):
-    return TautomerRecord(
-        molecule=MoleculeRef.from_smiles(a),
-        quantity=logkt_q(value, phase),
-        fidelity=fidelity,
-        source="tautobase",
-        tautomer_a_smiles=a,
-        tautomer_b_smiles=b,
-        date=date,
-    )
-
-
-def test_keto_enol_is_recognised_as_a_tautomer_pair():
-    assert are_tautomers("CC(=O)CC(C)=O", "CC(O)=CC(C)=O")
-
-
-def test_different_compounds_are_not_a_tautomer_pair():
-    assert not are_tautomers("CC(=O)CC(C)=O", "CCC(=O)CC(C)=O")
-
-
-def test_clean_tautomer_batch_has_no_errors(experiment):
-    records = [taut("CC(=O)CC(C)=O", "CC(O)=CC(C)=O", 0.8, fidelity=experiment)]
-    issues = audit_tautomer_records(records)
-    assert not [i for i in issues if i.severity == "error"], summarise(issues)
-
-
-def test_saturated_ratios_are_flagged(experiment):
-    records = [taut("CC(=O)CC(C)=O", "CC(O)=CC(C)=O", 7.5, fidelity=experiment)]
-    assert "saturated-ratio" in codes(audit_tautomer_records(records))
-
-
-def test_mixed_solvent_tautomers_are_an_error(experiment):
-    records = [
-        taut("CC(=O)CC(C)=O", "CC(O)=CC(C)=O", 0.8, fidelity=experiment),
-        taut(
-            "CC(=O)CC(=O)C",
-            "CC(O)=CC(C)=O",
-            1.2,
-            phase=Phase("solution", "cyclohexane", 0.0),
-            fidelity=experiment,
-        ),
-    ]
-    assert "mixed-solvent" in codes(audit_tautomer_records(records))
 
 
 def test_summarise_reports_counts(experiment):

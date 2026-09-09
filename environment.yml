@@ -6,10 +6,13 @@ dependencies:
   - rdkit=2025.*
   - numpy
   - pandas
-  - pydantic
-  - pyyaml
-  - scikit-learn
-  - lightgbm
   - pytest
   - pytest-cov
+  # GFN2-xTB provides the physics-informed atom descriptors. Optional: the
+  # model trains without it, and scripts/train_pka.py --no-xtb is the ablation.
+  - xtb=6.7.*
   - pip
+  - pip:
+      # CPU build is sufficient; the graphs are small.
+      - --index-url https://download.pytorch.org/whl/cpu
+      - torch

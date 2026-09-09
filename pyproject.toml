@@ -4,10 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "molprop"
-version = "0.1.0"
-description = "Drug-oriented QM property prediction: BDE, pKa, tautomer ratios"
+version = "0.2.0"
+description = "Physics-informed GNN for pKa prediction and most-acidic-site identification"
+readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["numpy", "pandas", "rdkit"]
+license = { text = "MIT" }
+dependencies = [
+    "numpy",
+    "pandas",
+    "rdkit",
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

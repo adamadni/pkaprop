@@ -5,9 +5,9 @@ Project constraint: no random splits, ever. There is deliberately no
 
 Two things this module enforces that a naive scaffold split does not:
 
-1. **Group integrity.** A molecule contributes many BDE records and a tautomer
-   record names two structures. The unit that must not straddle a fold is the
-   record's `group_key`, and every assignment is checked against it.
+1. **Group integrity.** One molecule contributes a record per ionisable site.
+   The unit that must not straddle a fold is the record's `group_key`, and
+   every assignment is checked against it.
 
 2. **The right holdout unit.** Murcko scaffold is the wrong invariant for a
    local property. pKa is dominated by the environment of the ionisable site,
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .chem import atom_environment, murcko_scaffold
-from .records import BDERecord, PKaRecord, PropertyRecord, TautomerRecord
+from .records import PKaRecord, PropertyRecord
 
 __all__ = [
     "SplitError",
@@ -137,21 +137,15 @@ class Split:
 def reaction_centre_key(record: PropertyRecord, radius: int = 2) -> str:
     """Grouping key describing the local chemistry the property depends on.
 
-    BDE   -- environment of the heavy atom(s) of the dissociating bond.
-    pKa   -- environment of the ionisable site (microscopic records only).
-    Taut  -- the RDKit canonical tautomer, which groups a whole tautomer family.
-    """
-    if isinstance(record, BDERecord):
-        mol = record.molecule.indexed()
-        heavy = [
-            i
-            for i in record.bond.as_tuple()
-            if mol.GetAtomWithIdx(i).GetSymbol() != "H"
-        ]
-        atoms = heavy or list(record.bond.as_tuple())
-        envs = sorted(atom_environment(record.molecule.smiles, i, radius) for i in atoms)
-        return "|".join(envs)
+    For pKa that is the environment of the ionisable site. Murcko scaffold is
+    the wrong invariant here: a molecule can change scaffold entirely while
+    keeping the same aniline, and a scaffold split would then read as
+    generalisation when the model has simply seen that site before.
 
+    Only microscopic records name a site. A macroscopic value is a property of
+    the whole titration, so it has no single centre and this raises rather than
+    silently falling back to something coarser.
+    """
     if isinstance(record, PKaRecord):
         if record.resolution != "micro":
             raise SplitError(
@@ -159,14 +153,6 @@ def reaction_centre_key(record: PropertyRecord, radius: int = 2) -> str:
                 "to microstates first, or use scaffold_split / a molecule-level split"
             )
         return atom_environment(record.molecule.smiles, record.site_atom_idx, radius)
-
-    if isinstance(record, TautomerRecord):
-        from rdkit import Chem
-        from rdkit.Chem.MolStandardize import rdMolStandardize
-
-        enumerator = rdMolStandardize.TautomerEnumerator()
-        canon = enumerator.Canonicalize(Chem.MolFromSmiles(record.tautomer_a_smiles))
-        return Chem.MolToSmiles(canon, canonical=True)
 
     raise SplitError(
         f"no reaction-centre definition for {type(record).__name__}; add one "

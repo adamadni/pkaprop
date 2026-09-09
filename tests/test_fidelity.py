@@ -98,19 +98,20 @@ def test_ladder_rejects_duplicate_ranks(xtb_gas, dft_gas):
         ladder.add(dft_gas, 0)
 
 
-def test_ladder_reference_is_the_top_rung(bde_ladder, dft_gas):
-    assert bde_ladder.reference.id == dft_gas.id
+def test_ladder_reference_is_the_top_rung(pka_ladder, experiment):
+    """For pKa the reference is experiment: a computed pKa is itself calibrated."""
+    assert pka_ladder.reference.id == experiment.id
 
 
-def test_unregistered_fidelity_cannot_be_ranked(bde_ladder, dft_water):
+def test_unregistered_fidelity_cannot_be_ranked(pka_ladder, xtb_gas):
     with pytest.raises(FidelityError, match="not registered"):
-        bde_ladder.rank(dft_water)
+        pka_ladder.rank(xtb_gas)
 
 
-def test_delta_target_must_outrank_the_base(bde_ladder, xtb_gas, dft_gas):
-    DeltaSpec(base=xtb_gas, target=dft_gas, ladder=bde_ladder)
+def test_delta_target_must_outrank_the_base(pka_ladder, dft_water, experiment):
+    DeltaSpec(base=dft_water, target=experiment, ladder=pka_ladder)
     with pytest.raises(FidelityError, match="must outrank"):
-        DeltaSpec(base=dft_gas, target=xtb_gas, ladder=bde_ladder)
+        DeltaSpec(base=experiment, target=dft_water, ladder=pka_ladder)
 
 
 def test_pka_delta_targets_experiment(pka_ladder, dft_water, experiment):

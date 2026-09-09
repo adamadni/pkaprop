@@ -1,11 +1,13 @@
-"""Shared fixtures. Kept small and explicit."""
+"""Shared fixtures and helpers."""
 
 from __future__ import annotations
 
 import pytest
 
-from molprop.chem import BondRef, indexed_mol
-from molprop.fidelity import ConformerProtocol, Fidelity, FidelityLadder, Tier
+from molprop.chem import indexed_mol
+from molprop.fidelity import ConformerProtocol, Fidelity, Tier
+from molprop.records import MoleculeRef, PKaRecord
+from molprop.units import LOG10_UNIT, Quantity, QuantityKind, water
 
 
 @pytest.fixture
@@ -61,24 +63,10 @@ def experiment() -> Fidelity:
 
 
 @pytest.fixture
-def bde_ladder(xtb_gas, dft_gas) -> FidelityLadder:
-    return FidelityLadder("bde").add(xtb_gas, 0).add(dft_gas, 10)
+def pka_ladder(dft_water, experiment):
+    from molprop.fidelity import FidelityLadder
 
-
-@pytest.fixture
-def pka_ladder(dft_water, experiment) -> FidelityLadder:
     return FidelityLadder("pka").add(dft_water, 5).add(experiment, 10)
-
-
-def find_bond(canonical: str, sym_a: str, sym_b: str) -> BondRef:
-    """First bond in the indexed mol joining the two given elements."""
-    mol = indexed_mol(canonical)
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        pair = sorted((mol.GetAtomWithIdx(i).GetSymbol(), mol.GetAtomWithIdx(j).GetSymbol()))
-        if pair == sorted((sym_a, sym_b)):
-            return BondRef(i, j)
-    raise AssertionError(f"no {sym_a}-{sym_b} bond in {canonical}")
 
 
 def find_atom(canonical: str, symbol: str, *, with_h: bool = False) -> int:
@@ -91,3 +79,33 @@ def find_atom(canonical: str, symbol: str, *, with_h: bool = False) -> int:
             continue
         return atom.GetIdx()
     raise AssertionError(f"no {symbol} atom in {canonical}")
+
+
+def macro_record(smiles: str, value: float, fidelity, *, step: int = 1, **kw) -> PKaRecord:
+    """A macroscopic pKa record, the shape most of the corpus takes."""
+    return PKaRecord(
+        molecule=MoleculeRef.from_smiles(smiles),
+        quantity=Quantity(value, LOG10_UNIT, QuantityKind.PKA, water(0.15), 298.15),
+        fidelity=fidelity,
+        source="test",
+        resolution="macro",
+        step_index=step,
+        **kw,
+    )
+
+
+def micro_record(
+    smiles: str, value: float, fidelity, *, protonated: str, deprotonated: str, **kw
+) -> PKaRecord:
+    """A microscopic pKa record naming the site that loses the proton."""
+    return PKaRecord(
+        molecule=MoleculeRef.from_smiles(smiles),
+        quantity=Quantity(value, LOG10_UNIT, QuantityKind.PKA, water(0.15), 298.15),
+        fidelity=fidelity,
+        source="test",
+        resolution="micro",
+        site_atom_idx=find_atom(smiles, "O", with_h=True),
+        protonated_smiles=protonated,
+        deprotonated_smiles=deprotonated,
+        **kw,
+    )

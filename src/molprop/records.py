@@ -3,12 +3,9 @@
 One record is one measured-or-computed number, with the molecule it belongs to,
 the fidelity that produced it, and enough structure to be split without leakage.
 
-Every record carries a `group_key`. It is the unit that must never be broken
-across a train/test boundary. For BDE that is the molecule (a molecule
-contributes many bonds, and scattering them across folds leaks). For pKa the
-default is also the molecule, but the split machinery can regroup on the
-reaction-centre environment, which is the holdout unit that actually tests
-generalisation for a local property.
+Every record carries a `group_key` -- the unit that must never be broken across
+a train/test boundary. It is the molecule, because one molecule contributes a
+record per ionisable site and scattering those across folds leaks.
 """
 
 from __future__ import annotations
@@ -19,25 +16,16 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
 from .chem import (
-    BondRef,
     MoleculeError,
-    bond_label,
     canonical_smiles,
     inchikey,
     indexed_mol,
-    molecular_formula,
     net_charge,
 )
 from .fidelity import Fidelity
 from .units import Quantity, QuantityKind, UnitError
 
-__all__ = [
-    "MoleculeRef",
-    "PropertyRecord",
-    "BDERecord",
-    "PKaRecord",
-    "TautomerRecord",
-]
+__all__ = ["MoleculeRef", "PropertyRecord", "PKaRecord"]
 
 
 def _stable_id(payload: dict[str, Any]) -> str:
@@ -157,54 +145,6 @@ class PropertyRecord:
 
 
 @dataclass(frozen=True)
-class BDERecord(PropertyRecord):
-    """A homolytic bond dissociation enthalpy for one named bond.
-
-    Note the framing: this is a *homolytic* quantity (A-H -> A. + H.), related
-    to the heterolytic pKa only through the thermodynamic cycle
-
-        BDE(A-H) = dG_acid(A-H) + EA(A.) - IE(H)
-
-    i.e. they differ by the electron affinity of the resulting radical, which
-    varies by tens of kcal/mol across chemotypes. A BDE record is never a pKa
-    label, and the acidic-X-H subset is an auxiliary task, not a substitute.
-    """
-
-    bond: BondRef | None = None
-    _allowed_kinds: ClassVar[tuple[QuantityKind, ...] | None] = (QuantityKind.BDE,)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.bond is None:
-            raise ValueError("a BDE record must name the bond it refers to")
-        # Raises if the indices are not a real bond in the indexed mol.
-        bond_label(self.molecule.indexed(), self.bond.atom_i, self.bond.atom_j)
-        if self.quantity.phase.medium != "gas":
-            raise UnitError(
-                "BDE is conventionally a gas-phase quantity; a solution-phase "
-                "value must say so explicitly in metadata and use a solution fidelity"
-            )
-
-    @property
-    def bond_type(self) -> str:
-        """Element-pair label, e.g. 'C-H'. Useful as a lookup baseline key."""
-        return bond_label(self.molecule.indexed(), self.bond.atom_i, self.bond.atom_j)
-
-    @property
-    def is_acidic_xh(self) -> bool:
-        """True for O-H, N-H and S-H -- the auxiliary-head subset."""
-        return self.bond_type in ("H-O", "H-N", "H-S")
-
-    def _identity_payload(self) -> dict[str, Any]:
-        p = super()._identity_payload()
-        p["bond"] = list(self.bond.as_tuple())
-        return p
-
-    def _extra_dict(self) -> dict[str, Any]:
-        return {"bond": list(self.bond.as_tuple()), "bond_type": self.bond_type}
-
-
-@dataclass(frozen=True)
 class PKaRecord(PropertyRecord):
     """An acid dissociation constant, macroscopic or microscopic.
 
@@ -284,56 +224,4 @@ class PKaRecord(PropertyRecord):
             "site_atom_idx": self.site_atom_idx,
             "protonated_smiles": self.protonated_smiles,
             "deprotonated_smiles": self.deprotonated_smiles,
-        }
-
-
-@dataclass(frozen=True)
-class TautomerRecord(PropertyRecord):
-    """log10([B]/[A]) for an ordered tautomer pair.
-
-    The sign convention is fixed by the field order: positive means B is
-    favoured. Both tautomers must share a molecular formula and net charge --
-    a "tautomer pair" that does not is a different compound, and that mistake
-    is common in aggregated literature sets.
-    """
-
-    tautomer_a_smiles: str | None = None
-    tautomer_b_smiles: str | None = None
-
-    _allowed_kinds: ClassVar[tuple[QuantityKind, ...] | None] = (
-        QuantityKind.LOG_TAUTOMER_RATIO,
-    )
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if not (self.tautomer_a_smiles and self.tautomer_b_smiles):
-            raise ValueError("a tautomer record needs both tautomer SMILES")
-        a = canonical_smiles(self.tautomer_a_smiles)
-        b = canonical_smiles(self.tautomer_b_smiles)
-        object.__setattr__(self, "tautomer_a_smiles", a)
-        object.__setattr__(self, "tautomer_b_smiles", b)
-        if a == b:
-            raise MoleculeError("tautomer A and B are the same structure")
-        if molecular_formula(a) != molecular_formula(b):
-            raise MoleculeError(
-                f"tautomers must share a molecular formula: "
-                f"{a} is {molecular_formula(a)}, {b} is {molecular_formula(b)}"
-            )
-        if net_charge(a) != net_charge(b):
-            raise MoleculeError("tautomers must share a net charge")
-
-    @property
-    def group_key(self) -> str:
-        """Group on the pair, not on one member, so a pair cannot straddle folds."""
-        return "|".join(sorted((self.tautomer_a_smiles or "", self.tautomer_b_smiles or "")))
-
-    def _identity_payload(self) -> dict[str, Any]:
-        p = super()._identity_payload()
-        p["pair"] = [self.tautomer_a_smiles, self.tautomer_b_smiles]
-        return p
-
-    def _extra_dict(self) -> dict[str, Any]:
-        return {
-            "tautomer_a_smiles": self.tautomer_a_smiles,
-            "tautomer_b_smiles": self.tautomer_b_smiles,
         }

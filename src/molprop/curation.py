@@ -11,8 +11,6 @@ tautomer sets untrustworthy, in rough order of how often they bite:
 * macroscopic labels used as if they were site-specific
 * mixed or unstated solvent, temperature and ionic strength
 * the same compound appearing twice with irreconcilable values
-* "tautomer pairs" that are not related by tautomerism at all
-* qualitative observations ("only the keto form is seen") encoded as numbers
 """
 
 from __future__ import annotations
@@ -22,19 +20,15 @@ from dataclasses import dataclass
 from typing import Literal, Sequence
 
 from rdkit import Chem
-from rdkit.Chem.MolStandardize import rdMolStandardize
 
-from .records import PKaRecord, PropertyRecord, TautomerRecord
+from .records import PKaRecord, PropertyRecord
 
 __all__ = [
     "SourceSpec",
     "KNOWN_PKA_SOURCES",
-    "KNOWN_TAUTOMER_SOURCES",
     "CurationIssue",
     "audit_pka_records",
-    "audit_tautomer_records",
     "ionisable_sites",
-    "are_tautomers",
 ]
 
 Severity = Literal["error", "warning"]
@@ -107,29 +101,6 @@ KNOWN_PKA_SOURCES: tuple[SourceSpec, ...] = (
     ),
 )
 
-#: Candidate tautomer sources. Quantitative ratios are genuinely scarce.
-KNOWN_TAUTOMER_SOURCES: tuple[SourceSpec, ...] = (
-    SourceSpec(
-        name="tautobase",
-        resolution="n/a",
-        caveats=(
-            "many entries are qualitative or solvent-heterogeneous",
-            "a substantial fraction are not quantitative ratios at all",
-        ),
-    ),
-    SourceSpec(
-        name="wahl-sander",
-        resolution="n/a",
-        caveats=("small and careful; treat as validation",),
-    ),
-    SourceSpec(
-        name="sampl2",
-        resolution="n/a",
-        caveats=("blind-challenge tautomer ratios; very small",),
-    ),
-)
-
-
 @dataclass(frozen=True)
 class CurationIssue:
     severity: Severity
@@ -179,33 +150,6 @@ def ionisable_sites(smiles: str) -> list[tuple[str, int]]:
         if current is None or current in out_of_window_acids:
             best[site.atom_idx] = site.label
     return sorted((label, idx) for idx, label in best.items())
-
-
-def are_tautomers(smiles_a: str, smiles_b: str, *, max_tautomers: int = 200) -> bool:
-    """True if B appears in RDKit's tautomer enumeration of A.
-
-    Used to catch "tautomer pairs" that are actually different compounds or
-    different protonation states. RDKit's enumerator is incomplete, so a False
-    is a warning to check by hand, not a verdict.
-    """
-    mol_a, mol_b = Chem.MolFromSmiles(smiles_a), Chem.MolFromSmiles(smiles_b)
-    if mol_a is None or mol_b is None:
-        return False
-    params = rdMolStandardize.CleanupParameters()
-    params.maxTautomers = max_tautomers
-    enumerator = rdMolStandardize.TautomerEnumerator(params)
-    target = Chem.MolToSmiles(mol_b, canonical=True)
-    for taut in enumerator.Enumerate(mol_a):
-        if Chem.MolToSmiles(taut, canonical=True) == target:
-            return True
-    # Fall back on comparing canonical tautomers, which is weaker but catches
-    # pairs the enumeration truncated.
-    try:
-        return Chem.MolToSmiles(enumerator.Canonicalize(mol_a)) == Chem.MolToSmiles(
-            enumerator.Canonicalize(mol_b)
-        )
-    except Exception:  # pragma: no cover - RDKit can throw on odd valences
-        return False
 
 
 # --------------------------------------------------------------------------
@@ -373,75 +317,6 @@ def audit_pka_records(
                 tuple(r.record_id for r in no_date),
             )
         )
-
-    issues.extend(_conflicting_duplicates(records, duplicate_tolerance))
-    return issues
-
-
-def audit_tautomer_records(
-    records: Sequence[TautomerRecord],
-    *,
-    duplicate_tolerance: float = 0.3,
-    saturation_threshold: float = 4.0,
-    check_tautomerism: bool = True,
-) -> list[CurationIssue]:
-    """Check a candidate tautomer-ratio batch against the curation contract."""
-    issues: list[CurationIssue] = []
-    if not records:
-        return issues
-
-    no_temp = [r for r in records if r.quantity.temperature_K is None]
-    if no_temp:
-        issues.append(
-            CurationIssue(
-                "error",
-                "missing-temperature",
-                "a log ratio without a temperature is not a free energy",
-                tuple(r.record_id for r in no_temp),
-            )
-        )
-
-    solvents = {r.quantity.phase.solvent for r in records}
-    if len(solvents) > 1:
-        issues.append(
-            CurationIssue(
-                "error",
-                "mixed-solvent",
-                f"tautomer ratios are strongly solvent dependent; this batch mixes "
-                f"{sorted(s or '?' for s in solvents)}",
-            )
-        )
-
-    saturated = [r for r in records if abs(r.quantity.value) >= saturation_threshold]
-    if saturated:
-        issues.append(
-            CurationIssue(
-                "warning",
-                "saturated-ratio",
-                f"|log K| >= {saturation_threshold} usually encodes a qualitative "
-                f"observation ('only one form is seen') as a number; these are "
-                f"censored values and should be modelled as such or excluded",
-                tuple(r.record_id for r in saturated),
-            )
-        )
-
-    if check_tautomerism:
-        not_tautomers = [
-            r
-            for r in records
-            if not are_tautomers(r.tautomer_a_smiles, r.tautomer_b_smiles)
-        ]
-        if not_tautomers:
-            issues.append(
-                CurationIssue(
-                    "warning",
-                    "not-a-tautomer-pair",
-                    "RDKit's enumeration does not connect these structures; either "
-                    "the enumerator is incomplete for this chemotype or the pair is "
-                    "mislabelled -- check by hand before registering",
-                    tuple(r.record_id for r in not_tautomers),
-                )
-            )
 
     issues.extend(_conflicting_duplicates(records, duplicate_tolerance))
     return issues

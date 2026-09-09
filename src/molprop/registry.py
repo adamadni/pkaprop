@@ -21,9 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from .chem import BondRef
 from .fidelity import Fidelity
-from .records import BDERecord, MoleculeRef, PKaRecord, PropertyRecord, TautomerRecord
+from .records import MoleculeRef, PKaRecord, PropertyRecord
 from .units import Quantity
 
 __all__ = ["RegistryError", "UnitsAudit", "DatasetManifest", "Registry"]
@@ -34,9 +33,7 @@ class RegistryError(RuntimeError):
 
 
 _RECORD_TYPES = {
-    "BDERecord": BDERecord,
     "PKaRecord": PKaRecord,
-    "TautomerRecord": TautomerRecord,
     "PropertyRecord": PropertyRecord,
 }
 
@@ -105,9 +102,6 @@ def _record_from_dict(
         date=d.get("date"),
         metadata=d.get("metadata") or {},
     )
-    if cls is BDERecord:
-        i, j = d["bond"]
-        return BDERecord(bond=BondRef(i, j), **common)
     if cls is PKaRecord:
         return PKaRecord(
             resolution=d["resolution"],
@@ -115,12 +109,6 @@ def _record_from_dict(
             site_atom_idx=d.get("site_atom_idx"),
             protonated_smiles=d.get("protonated_smiles"),
             deprotonated_smiles=d.get("deprotonated_smiles"),
-            **common,
-        )
-    if cls is TautomerRecord:
-        return TautomerRecord(
-            tautomer_a_smiles=d["tautomer_a_smiles"],
-            tautomer_b_smiles=d["tautomer_b_smiles"],
             **common,
         )
     return PropertyRecord(**common)

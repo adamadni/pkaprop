@@ -1,8 +1,12 @@
 # molprop — physics-informed pKa prediction
 
 Predicts a pKa for **every ionisable site** in a small molecule and reports the
-**most acidic** one. A graph neural network does the learning; GFN2-xTB
-electronic descriptors supply the physics prior.
+**most acidic** one, using a graph neural network.
+
+GFN2-xTB electronic descriptors are implemented and wired in as an optional
+physics prior. **Measured on this dataset, they do not help** — see
+[Does the physics help?](#does-the-physics-help). The pipeline is kept because
+the ablation is the useful artefact, not because the physics earned its place.
 
 ```python
 from molprop.training import most_acidic_site
@@ -25,14 +29,14 @@ anywhere in this project** — see [Splitting](#splitting).
 | global median | 1.95 | 2.29 | −0.00 | 28% | 52% |
 | acid/base median | 1.83 | 2.22 | 0.06 | 30% | 61% |
 | site-class median | 1.34 | 1.75 | 0.42 | 49% | 75% |
-| **pKa GNN** | **0.84** | **1.21** | **0.72** | **71%** | **90%** |
+| **pKa GNN** | **0.84** | **1.22** | **0.72** | **71%** | **92%** |
 
 Held-out sets curated by the data source, never seen in training or validation:
 
 | set | n | MAE | RMSE | within 1 unit |
 |---|---|---|---|---|
-| Novartis | 280 | 1.03 | 1.39 | 58% |
-| AvLiLuMoVe | 123 | 0.57 | 0.80 | 85% |
+| Novartis | 280 | 1.06 | 1.43 | 59% |
+| AvLiLuMoVe | 123 | 0.47 | 0.63 | 87% |
 
 The baseline that matters is **site-class median** — the pKa you would guess
 from knowing only the functional group (carboxylic acid, aliphatic amine,
@@ -140,10 +144,10 @@ Two quantities per molecule, from a single point on one force-field conformer:
   delocalisation: a carboxyl oxygen with substantial partial double-bond
   character behaves very differently from an isolated alkoxide.
 
-**They are optional, and that is the point.** `featurise` zero-fills those
-columns when descriptors are absent, so the identical architecture trains with
-and without them. `--no-xtb` is a real ablation, not a fallback — the only way
-to know whether the physics earns its compute is to measure it.
+They are optional. `featurise` zero-fills those columns when descriptors are
+absent and sets an explicit availability flag, because zero is a legitimate
+partial charge and the model would otherwise be unable to distinguish "xTB
+failed here" from "this atom is neutral". 1.6% of molecules fail the xTB step.
 
 One conformer is used deliberately: these quantities are dominated by
 connectivity and only weakly conformer-dependent, while generating and
@@ -151,7 +155,49 @@ optimising five conformers costs more than the xTB call itself. That trade-off
 is part of the cache key, so revisiting it cannot silently reuse stale
 descriptors.
 
----
+### Does the physics help?
+
+**No — not measurably, on this dataset.** Identical architecture, identical
+hyper-parameters, identical scaffold split, 599 shared test sites:
+
+| arm | MAE | RMSE |
+|---|---|---|
+| no xTB | **0.838** | **1.224** |
+| with xTB | 0.849 | 1.259 |
+
+Paired bootstrap on the difference, 20,000 resamples:
+
+```
+xTB - no-xTB:  +0.012 MAE   95% CI [-0.040, +0.062]   NOT significant
+```
+
+Held-out sets agree: Novartis 1.06 → 1.11, AvLiLuMoVe 0.47 → 0.48. Both
+directions are within noise.
+
+**Why this is worth knowing rather than hiding.** The most likely explanation is
+redundancy: a message-passing network reading element, charge, hybridisation and
+bond order from the graph already recovers most of what a Mulliken charge
+encodes, because both are largely determined by connectivity. The xTB numbers
+add compute (~30 min of descriptor generation for 6,418 molecules) without
+adding information the architecture did not already have.
+
+This is the same pattern the BDE work found: xTB information turned out to be
+largely redundant with what a structural model extracts on its own. Two
+independent observations of the same effect is worth more than either alone.
+
+Where physics *would* be expected to earn its place, and what to try next:
+
+- **Conformer-dependent descriptors.** Charges from one conformer are nearly a
+  function of the graph. Solvent-accessible surface area, or an intramolecular
+  hydrogen-bond indicator, are not — and both shift pKa substantially.
+- **Descriptors of the conjugate base, not the acid.** pKa is a difference
+  between two species. Featurising only the neutral form asks the model to
+  infer the anion's stability; computing the deprotonated microstate (which
+  `enumeration` already generates) and feeding the *change* in charge
+  distribution is much closer to the physical quantity.
+- **A thermodynamic-cycle term.** A cheap ΔG of deprotonation would be a
+  genuine physical estimate rather than a descriptor, and delta-learning onto
+  experiment is the framing the `fidelity` module was built for.
 
 ## Data
 
@@ -269,8 +315,8 @@ pip install -e ".[dev]"
 
 python scripts/fetch_data.py              # download sources with checksums
 python scripts/precompute_xtb.py          # warm the descriptor cache
-python scripts/train_pka.py --xtb         # train with physics
-python scripts/train_pka.py --no-xtb      # ablation without it
+python scripts/train_pka.py --no-xtb      # the better arm; see the ablation
+python scripts/train_pka.py --xtb         # with physics descriptors
 
 pytest
 ```
@@ -312,14 +358,15 @@ dissociation energies, pKa and tautomer ratios, and was rescoped to pKa alone.
 The BDE track — ALFABET import, xTB campaigns, a direct-vs-delta ablation — is
 preserved in commit `c0fa78b` rather than deleted outright.
 
-Two findings from that work shaped this one. GFN2-xTB explains ~74% of C–H
+Three findings from that work shaped this one. GFN2-xTB explains ~74% of C–H
 bond-strength variance but only ~10% for O–H (r = 0.51, n = 1,528), so cheap
-semiempirical thermochemistry is weakest exactly where acidic chemistry lives —
-which is why xTB enters here as a *descriptor* feeding a learned model rather
-than as a physical baseline to correct. And on the BDE benchmark an aggregate
-MAE of 2.33 hid a model that was 6× **worse** than a trivial lookup on rare bond
-types, which is why results here are reported against a class-wise baseline
-rather than a single headline number.
+semiempirical thermochemistry is weakest exactly where acidic chemistry lives.
+On the BDE benchmark an aggregate MAE of 2.33 hid a model that was 6× **worse**
+than a trivial lookup on rare bond types, which is why results here are reported
+against a class-wise baseline rather than a single headline number. And xTB
+information proved largely redundant with what a structural model extracts on
+its own — a result reproduced here, and the reason the physics arm is reported
+as a measured negative rather than assumed to help.
 
 ## Licence
 

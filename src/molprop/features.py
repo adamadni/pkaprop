@@ -70,6 +70,7 @@ ATOM_FEATURES = (
     + 1                      # in ring
     + 1                      # xTB partial charge
     + 1                      # xTB total Wiberg bond order
+    + 1                      # xTB descriptors present?
 )
 BOND_FEATURES = (len(BOND_TYPES) + 1) + 3  # type one-hot + other, conjugated, ring, wbo
 
@@ -272,6 +273,11 @@ def featurise(smiles: str, descriptors: XTBDescriptors | None = None) -> MolGrap
 
     charges = np.zeros(n, dtype=np.float32)
     totals = np.zeros(n, dtype=np.float32)
+    # Zero is a legitimate partial charge, so a bare zero-fill would be
+    # indistinguishable from "this atom is genuinely neutral". The flag lets
+    # the model learn to ignore the physics columns when they are absent --
+    # 1.6% of molecules fail the xTB step.
+    has_xtb = float(descriptors is not None)
     if descriptors is not None:
         supplied = np.asarray(descriptors.charges, dtype=np.float32)
         charges[: min(n, len(supplied))] = supplied[:n]
@@ -287,7 +293,7 @@ def featurise(smiles: str, descriptors: XTBDescriptors | None = None) -> MolGrap
             + _clamped_one_hot(atom.GetTotalNumHs(), 0, 4)
             + _one_hot(atom.GetHybridization(), HYBRIDISATIONS)
             + [float(atom.GetIsAromatic()), float(atom.IsInRing())]
-            + [float(charges[i]), float(totals[i])]
+            + [float(charges[i]), float(totals[i]), has_xtb]
         )
     atom_matrix = np.asarray(rows, dtype=np.float32)
 

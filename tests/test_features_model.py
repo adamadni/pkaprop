@@ -40,9 +40,20 @@ def test_sites_are_found_and_in_range():
 
 
 def test_featurisation_works_without_xtb():
-    """The physics features are optional; zero-filled when absent."""
+    """The physics features are optional; zero-filled and flagged when absent."""
     graph = featurise("Oc1ccccc1")
-    assert np.allclose(graph.atom_features[:, -2:], 0.0)
+    assert np.allclose(graph.atom_features[:, -3:-1], 0.0)   # charge, bond order
+    assert np.allclose(graph.atom_features[:, -1], 0.0)      # availability flag
+
+
+def test_missing_physics_is_distinguishable_from_zero_physics():
+    """Zero is a valid partial charge, so absence needs its own signal."""
+    from molprop.features import XTBDescriptors
+
+    absent = featurise("Oc1ccccc1")
+    present = featurise("Oc1ccccc1", XTBDescriptors(charges=(0.0,) * 7, bond_orders={}))
+    assert absent.atom_features[0, -1] == 0.0
+    assert present.atom_features[0, -1] == 1.0
 
 
 def test_a_single_atom_molecule_does_not_crash():

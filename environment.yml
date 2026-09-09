@@ -1,0 +1,15 @@
+name: molprop
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rdkit=2025.*
+  - numpy
+  - pandas
+  - pydantic
+  - pyyaml
+  - scikit-learn
+  - lightgbm
+  - pytest
+  - pytest-cov
+  - pip

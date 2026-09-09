@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+.ipynb_checkpoints/
+
+# Registered datasets and model artefacts are large and reproducible from
+# scripts/fetch_data.py; they are not source.
+data/registry/
+data/raw/
+artifacts/
+*.pt
+*.npz

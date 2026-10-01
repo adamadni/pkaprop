@@ -356,7 +356,7 @@ scripts/
 This codebase began as a broader QM property predictor covering bond
 dissociation energies, pKa and tautomer ratios, and was rescoped to pKa alone.
 The BDE track — ALFABET import, xTB campaigns, a direct-vs-delta ablation — is
-preserved in commit `c0fa78b` rather than deleted outright.
+preserved in commit `330cae1` rather than deleted outright.
 
 Three findings from that work shaped this one. GFN2-xTB explains ~74% of C–H
 bond-strength variance but only ~10% for O–H (r = 0.51, n = 1,528), so cheap
